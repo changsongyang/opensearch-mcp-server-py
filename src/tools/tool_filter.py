@@ -36,6 +36,57 @@ def _strip_schema_fields(schema: dict, fields) -> dict:
     return schema
 
 
+# Tools OpenSearch Serverless (AOSS) can serve. This is an allowlist because AOSS
+# supports far fewer tools than it rejects: it implements the index, document and
+# search data plane plus PPL, but not the cluster, node, monitoring, Search
+# Relevance Workbench or ml-commons memory APIs. Any tool not listed here is treated
+# as serverless-incompatible, so a newly added tool is excluded on AOSS until it is
+# explicitly verified and added. Membership was confirmed live against an AOSS
+# collection. See:
+# https://docs.aws.amazon.com/opensearch-service/latest/developerguide/serverless-genref.html
+SERVERLESS_COMPATIBLE_TOOLS: frozenset = frozenset(
+    {
+        'ListIndexTool',  # GET /_cat/indices
+        'IndexMappingTool',  # GET /<index>/_mapping
+        'GetIndexInfoTool',  # GET /<index>
+        'SearchIndexTool',  # POST /<index>/_search
+        'PPLQueryTool',  # POST /_plugins/_ppl
+        'DataDistributionTool',  # client-side analysis over _search/_count
+        'LogPatternAnalysisTool',  # client-side analysis over _search/_count
+        'MetricChangeAnalysisTool',  # client-side analysis over _search/_count
+        'GenericOpenSearchApiTool',  # passthrough; valid endpoints only
+        'ListClustersTool',  # server-side datasource listing, no backend call
+    }
+)
+
+
+def filter_serverless_incompatible(registry: dict) -> None:
+    """Remove tools that OpenSearch Serverless cannot serve from ``registry`` in place."""
+    for key in list(registry.keys()):
+        if key not in SERVERLESS_COMPATIBLE_TOOLS:
+            registry.pop(key, None)
+
+
+def _is_serverless_single_mode() -> bool:
+    """Detect a serverless connection in single mode from env/URL configuration."""
+    if os.getenv('AWS_OPENSEARCH_SERVERLESS', '').lower() == 'true':
+        return True
+    return 'aoss.amazonaws.com' in os.getenv('OPENSEARCH_URL', '').strip().lower()
+
+
+def _is_serverless_multi_mode() -> bool:
+    """True only when every configured multi-mode cluster is serverless.
+
+    Tools are advertised once for all clusters, so incompatible tools can only be
+    dropped at list time when there is no non-serverless cluster that could serve
+    them. Mixed deployments rely on the call-time guard instead.
+    """
+    from mcp_server_opensearch.clusters_information import cluster_registry
+
+    clusters = list(cluster_registry.values())
+    return bool(clusters) and all(c.is_serverless for c in clusters)
+
+
 def process_regex_patterns(regex_list, tool_names):
     """Process regex patterns and return matching tool names."""
     matching_tools = []
@@ -450,6 +501,10 @@ async def get_tools(tool_registry: dict, config_file_path: str = '') -> dict:
         non_memory = {
             name: info for name, info in tool_registry.items() if not info.get('memory_tool')
         }
+        # Drop serverless-incompatible tools when every configured cluster is
+        # serverless. Mixed deployments keep them and rely on the call-time guard.
+        if _is_serverless_multi_mode():
+            filter_serverless_incompatible(non_memory)
         category_to_tools = build_category_map(non_memory)
         tool_to_category = {
             dn.lower(): cat for cat, dns in category_to_tools.items() for dn in dns
@@ -467,6 +522,17 @@ async def get_tools(tool_registry: dict, config_file_path: str = '') -> dict:
     # Get OpenSearch version for compatibility checking (only in single mode)
     version = await get_opensearch_version(baseToolArgs(opensearch_cluster_name=''))
     logging.info(f'Connected OpenSearch version: {version}')
+
+    # A serverless connection cannot answer the version probe (GET / is unsupported),
+    # so it returns None and version gating is skipped. Log it and filter the tools
+    # serverless cannot serve instead of silently advertising the full catalog.
+    serverless = _is_serverless_single_mode()
+    if version is None:
+        logging.warning(
+            'Could not determine OpenSearch version; version-based tool gating is '
+            'skipped for this connection.'
+            + (' Applying serverless-aware tool filtering.' if serverless else '')
+        )
 
     env_config = {
         'enabled_tools': os.getenv('OPENSEARCH_ENABLED_TOOLS', ''),
@@ -502,6 +568,11 @@ async def get_tools(tool_registry: dict, config_file_path: str = '') -> dict:
 
         # Skip multi-only tools in single mode
         if info.get('multi_only') and mode != 'multi':
+            continue
+
+        # Skip tools OpenSearch Serverless cannot serve when connected to a
+        # serverless endpoint (version gating can't catch these — the probe fails).
+        if serverless and name not in SERVERLESS_COMPATIBLE_TOOLS:
             continue
 
         # If tool is not compatible with the current OpenSearch version, skip, don't enable
